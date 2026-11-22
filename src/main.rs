@@ -535,6 +535,177 @@ fn detail_score(a: &FrameSig, b: &FrameSig) -> f32 {
     0.55 * base + 0.45 * edge_corr
 }
 
+fn refine_exact_match(
+    file_a: &Path,
+    ts_a: f64,
+    file_b: &Path,
+    approx_ts_b: f64,
+    ffmpeg: &Path,
+) -> Option<(f64, f64, u32, f32, f32)> {
+    // Извлекаем высокодетальный кадр А (320x320) и его точный PTS
+    let (exact_ts_a, sig_a_hi) = extract_hires_frame(file_a, ts_a, ffmpeg)?;
+
+    // Декодируем окно +-0.25с (~12 нативных кадров) вокруг approx_ts_b в 320x320 с точным showinfo PTS
+    let win_start = (approx_ts_b - 0.25).max(0.0);
+    let seek_pre = (win_start - 1.5).max(0.0);
+    let seek_post = (win_start - seek_pre).max(0.0);
+
+    let output = create_hidden_cmd(ffmpeg)
+        .args([
+            "-ss", &format!("{:.4}", seek_pre),
+            "-i", &file_b.to_string_lossy(),
+            "-ss", &format!("{:.4}", seek_post),
+            "-t", "0.50",
+            "-vf", "scale=320:320:flags=lanczos,format=gray,showinfo",
+            "-f", "rawvideo",
+            "-pix_fmt", "gray",
+            "-"
+        ])
+        .output()
+        .ok()?;
+
+    let frame_bytes = 320 * 320;
+    let count = output.stdout.len() / frame_bytes;
+    if count == 0 {
+        return None;
+    }
+    let pts_list = parse_showinfo_pts(&output.stderr);
+
+    let mut best: Option<(f64, u32, f32, f32)> = None;
+    for i in 0..count {
+        let slice = &output.stdout[i * frame_bytes..(i + 1) * frame_bytes];
+        if let Some(sig_b_hi) = compute_hires_sig(slice) {
+            let hdiff = hamming_256(&sig_a_hi.hash, &sig_b_hi.hash);
+            let base = zncc_score(&sig_a_hi, &sig_b_hi);
+            let det = hires_detail_score(&sig_a_hi, &sig_b_hi);
+            if best.map_or(true, |(_, _, _, best_d)| det > best_d) {
+                let ts_b = if let Some(&raw_pts) = pts_list.get(i) {
+                    if raw_pts < seek_pre * 0.5 { seek_pre + raw_pts } else { raw_pts }
+                } else {
+                    win_start + (i as f64) * 0.041708
+                };
+                best = Some((ts_b, hdiff, base, det));
+            }
+        }
+    }
+
+    let (best_ts_b, hdiff, base, det) = best?;
+    Some((exact_ts_a, best_ts_b, hdiff, base, det))
+}
+
+fn extract_hires_frame(video: &Path, approx_ts: f64, ffmpeg: &Path) -> Option<(f64, FrameSig)> {
+    let seek_pre = (approx_ts - 1.5).max(0.0);
+    let seek_post = (approx_ts - seek_pre).max(0.0);
+    let output = create_hidden_cmd(ffmpeg)
+        .args([
+            "-ss", &format!("{:.4}", seek_pre),
+            "-i", &video.to_string_lossy(),
+            "-ss", &format!("{:.4}", seek_post),
+            "-frames:v", "1",
+            "-vf", "scale=320:320:flags=lanczos,format=gray,showinfo",
+            "-f", "rawvideo",
+            "-pix_fmt", "gray",
+            "-"
+        ])
+        .output()
+        .ok()?;
+
+    let frame_bytes = 320 * 320;
+    if output.stdout.len() < frame_bytes {
+        return None;
+    }
+    let sig = compute_hires_sig(&output.stdout[..frame_bytes])?;
+    let raw_pts = parse_showinfo_pts(&output.stderr).into_iter().next().unwrap_or(seek_post);
+    let exact_ts = if raw_pts < seek_pre * 0.5 { seek_pre + raw_pts } else { raw_pts };
+    Some((exact_ts, sig))
+}
+
+fn compute_hires_sig(raw_gray: &[u8]) -> Option<FrameSig> {
+    if raw_gray.len() < 320 * 320 {
+        return None;
+    }
+    const W: usize = 320;
+    const C: usize = 272;
+    const OFF: usize = 24;
+
+    let mut crop = vec![0f32; C * C];
+    let mut sum = 0.0f32;
+    for y in 0..C {
+        for x in 0..C {
+            let v = raw_gray[(y + OFF) * W + (x + OFF)] as f32;
+            crop[y * C + x] = v;
+            sum += v;
+        }
+    }
+    let n = (C * C) as f32;
+    let mean = sum / n;
+    let mut sq_sum = 0.0f32;
+    for v in &mut crop {
+        *v -= mean;
+        sq_sum += *v * *v;
+    }
+    let std_dev = sq_sum.sqrt();
+    if std_dev < 1e-3 {
+        return None;
+    }
+    for v in &mut crop {
+        *v /= std_dev;
+    }
+
+    let mut hash = [0u64; 4];
+    let mut bit = 0usize;
+    for r in 0..8 {
+        let y = (r * C) / 8 + 16;
+        for c in 0..16 {
+            let x1 = (c * C) / 17;
+            let x2 = ((c + 1) * C) / 17;
+            if crop[y * C + x2] > crop[y * C + x1] {
+                hash[bit / 64] |= 1u64 << (bit % 64);
+            }
+            bit += 1;
+        }
+    }
+    for r in 0..16 {
+        let y1 = (r * C) / 17;
+        let y2 = ((r + 1) * C) / 17;
+        for c in 0..8 {
+            let x = (c * C) / 8 + 16;
+            if crop[y2 * C + x] > crop[y1 * C + x] {
+                hash[bit / 64] |= 1u64 << (bit % 64);
+            }
+            bit += 1;
+        }
+    }
+
+    Some(FrameSig { hash, norm_luma: crop })
+}
+
+fn hires_detail_score(a: &FrameSig, b: &FrameSig) -> f32 {
+    let base = zncc_score(a, b);
+    const C: usize = 272;
+    let mut dot_g = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for y in 1..(C - 1) {
+        for x in 1..(C - 1) {
+            let idx = y * C + x;
+            let gx_a = a.norm_luma[idx + 1] - a.norm_luma[idx - 1];
+            let gy_a = a.norm_luma[idx + C] - a.norm_luma[idx - C];
+            let gx_b = b.norm_luma[idx + 1] - b.norm_luma[idx - 1];
+            let gy_b = b.norm_luma[idx + C] - b.norm_luma[idx - C];
+            dot_g += gx_a * gx_b + gy_a * gy_b;
+            norm_a += gx_a * gx_a + gy_a * gy_a;
+            norm_b += gx_b * gx_b + gy_b * gy_b;
+        }
+    }
+    let edge_corr = if norm_a > 1e-6 && norm_b > 1e-6 {
+        (dot_g / (norm_a * norm_b).sqrt()).clamp(-1.0, 1.0)
+    } else {
+        base
+    };
+    0.45 * base + 0.55 * edge_corr
+}
+
 fn save_frame_png(video: &Path, exact_pts: f64, out: &Path, ffmpeg: &Path) -> bool {
     let seek_pre = (exact_pts - 1.5).max(0.0);
     let seek_post = (exact_pts - seek_pre).max(0.0);
@@ -575,7 +746,7 @@ fn run_comparison(
 
     let sample_timestamps: Vec<f64> = (1..=samples).map(|i| start_a + step * i as f64).collect();
 
-    tx.send(WorkerMsg::Status(format!("Извлечение {} опорных кадров из Релиза А...", samples)));
+    let _ = tx.send(WorkerMsg::Status(format!("Извлечение {} опорных кадров из Релиза А...", samples)));
     let mut points_a = Vec::new();
 
     for (idx, &ts) in sample_timestamps.iter().enumerate() {
@@ -583,14 +754,14 @@ fn run_comparison(
             points_a.push((exact_pts_a, sig));
         }
         let p = (idx + 1) as f32 / samples as f32 * 0.30;
-        tx.send(WorkerMsg::Progress(p));
+        let _ = tx.send(WorkerMsg::Progress(p));
     }
 
     if points_a.is_empty() {
         return Err("Не удалось извлечь информативные кадры из Релиза А.".to_string());
     }
 
-    tx.send(WorkerMsg::Status("Покадровый поиск нативных кадров в Релизе Б...".to_string()));
+    let _ = tx.send(WorkerMsg::Status("Покадровый поиск и высокоточная сверка пар...".to_string()));
     let rate_guess = if dur_a > 0.0 { dur_b / dur_a } else { 1.0 };
     let mut matches: Vec<(f64, f64, u32, f32)> = Vec::new();
 
@@ -600,14 +771,16 @@ fn run_comparison(
         let end_b = (est_b + window_sec).min(dur_b);
         let span_b = (end_b - start_b).max(0.2);
 
-        if let Some((approx_ts_b, best_hdiff, base_zncc, det_score)) =
+        if let Some((approx_ts_b, _, _, _)) =
             find_best_match_in_window(&file_b, start_b, span_b, sig_a, &ffmpeg)
         {
-            if base_zncc >= 0.91 && best_hdiff <= 34 {
-                let exact_ts_b = extract_native_frame(&file_b, approx_ts_b, &ffmpeg)
-                    .map(|(pts, _)| pts)
-                    .unwrap_or(approx_ts_b);
-                matches.push((*ts_a, exact_ts_b, best_hdiff, det_score));
+            // Второй проход: сравниваем левый и правый кадры на сетке 320x320 по соседним кадрам
+            if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
+                refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
+            {
+                if hi_zncc >= 0.91 && hi_hdiff <= 34 {
+                    matches.push((exact_a, exact_b, hi_hdiff, hi_det));
+                }
             }
         }
 
