@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use serde::Serialize;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -154,8 +154,8 @@ impl Default for ScreenCompareApp {
             video_b: String::new(),
             from_time_str: "00:05:00".to_string(),
             to_time_str: "00:25:00".to_string(),
-            count: 6,
-            samples: 6,
+            count: 10,
+            samples: 24,
             window_sec: 20.0,
             is_running: false,
             status_text: "Перетащите два видеофайла мышкой в окно программы...".to_string(),
@@ -407,6 +407,12 @@ fn get_duration(video: &Path, ffmpeg: &Path) -> f64 {
     7200.0
 }
 
+fn log_debug(msg: &str) {
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("search_debug.log") {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
 fn parse_showinfo_pts(stderr: &[u8]) -> Vec<f64> {
     let text = String::from_utf8_lossy(stderr);
     let mut pts_list = Vec::new();
@@ -447,9 +453,7 @@ fn extract_native_frame(video: &Path, approx_ts: f64, ffmpeg: &Path) -> Option<(
         return None;
     }
     let sig = compute_frame_sig(&output.stdout[..frame_bytes])?;
-    let raw_pts = parse_showinfo_pts(&output.stderr).into_iter().next().unwrap_or(seek_post);
-    let exact_ts = if raw_pts < seek_pre * 0.5 { seek_pre + raw_pts } else { raw_pts };
-    Some((exact_ts, sig))
+    Some((approx_ts, sig))
 }
 
 fn find_best_match_in_window(
@@ -458,7 +462,7 @@ fn find_best_match_in_window(
     duration_sec: f64,
     sig_a: &FrameSig,
     ffmpeg: &Path,
-) -> Option<(f64, u32, f32, f32)> {
+) -> Option<(f64, u32, f32, f32, usize)> {
     let seek_pre = (start_sec - 1.5).max(0.0);
     let seek_post = (start_sec - seek_pre).max(0.0);
     let mut child = create_hidden_cmd(ffmpeg)
@@ -482,7 +486,8 @@ fn find_best_match_in_window(
     let mut buf = vec![0u8; 160 * 160];
 
     let mut frame_idx: usize = 0;
-    let mut best_match: Option<(f64, u32, f32, f32)> = None;
+    let mut best_match: Option<(f64, u32, f32, f32, usize)> = None;
+    let mut best_any: Option<(f64, u32, f32)> = None;
 
     loop {
         if reader.read_exact(&mut buf).is_err() {
@@ -493,20 +498,30 @@ fn find_best_match_in_window(
 
         if let Some(sig_b) = compute_frame_sig(&buf) {
             let hdiff = hamming_256(&sig_a.hash, &sig_b.hash);
-            if hdiff <= 68 {
-                let base_zncc = zncc_score(sig_a, &sig_b);
-                if base_zncc >= 0.76 {
-                    let det = detail_score(sig_a, &sig_b);
-                    if best_match.map_or(true, |(_, _, _, best_d)| det > best_d) {
-                        best_match = Some((approx_ts, hdiff, base_zncc, det));
-                    }
+            let base_zncc = zncc_score(sig_a, &sig_b);
+            if best_any.map_or(true, |(_, _, s)| base_zncc > s) {
+                best_any = Some((approx_ts, hdiff, base_zncc));
+            }
+            if hdiff <= 68 && base_zncc >= 0.76 {
+                let det = detail_score(sig_a, &sig_b);
+                if best_match.map_or(true, |(_, _, _, best_d, _)| det > best_d) {
+                    best_match = Some((approx_ts, hdiff, base_zncc, det, 0));
                 }
             }
         }
     }
 
     let _ = child.wait();
-    best_match
+    if let Some((ts, hd, zn, dt, _)) = best_match {
+        Some((ts, hd, zn, dt, frame_idx))
+    } else {
+        if let Some((ts, hd, zn)) = best_any {
+            log_debug(&format!("    [window {:.2}..{:.2}s] frames_read={} | NO PASS (best_any: ts={:.3}s hdiff={} zncc={:.4})", start_sec, start_sec + duration_sec, frame_idx, ts, hd, zn));
+        } else {
+            log_debug(&format!("    [window {:.2}..{:.2}s] frames_read={} | EMPTY/FLAT FRAMES", start_sec, start_sec + duration_sec, frame_idx));
+        }
+        None
+    }
 }
 
 fn detail_score(a: &FrameSig, b: &FrameSig) -> f32 {
@@ -545,8 +560,8 @@ fn refine_exact_match(
     // Извлекаем высокодетальный кадр А (320x320) и его точный PTS
     let (exact_ts_a, sig_a_hi) = extract_hires_frame(file_a, ts_a, ffmpeg)?;
 
-    // Декодируем окно +-0.25с (~12 нативных кадров) вокруг approx_ts_b в 320x320 с точным showinfo PTS
-    let win_start = (approx_ts_b - 0.25).max(0.0);
+    // Декодируем окно +-0.80с (~38 нативных кадров) вокруг approx_ts_b в 320x320
+    let win_start = (approx_ts_b - 0.80).max(0.0);
     let seek_pre = (win_start - 1.5).max(0.0);
     let seek_post = (win_start - seek_pre).max(0.0);
 
@@ -555,8 +570,8 @@ fn refine_exact_match(
             "-ss", &format!("{:.4}", seek_pre),
             "-i", &file_b.to_string_lossy(),
             "-ss", &format!("{:.4}", seek_post),
-            "-t", "0.50",
-            "-vf", "scale=320:320:flags=lanczos,format=gray,showinfo",
+            "-t", "1.60",
+            "-vf", "scale=320:320:flags=lanczos,format=gray",
             "-f", "rawvideo",
             "-pix_fmt", "gray",
             "-"
@@ -572,18 +587,16 @@ fn refine_exact_match(
     let pts_list = parse_showinfo_pts(&output.stderr);
 
     let mut best: Option<(f64, u32, f32, f32)> = None;
+    log_debug(&format!("    [refine 320x320] exact_ts_a={:.4}s | candidates={}:", exact_ts_a, count));
     for i in 0..count {
         let slice = &output.stdout[i * frame_bytes..(i + 1) * frame_bytes];
         if let Some(sig_b_hi) = compute_hires_sig(slice) {
             let hdiff = hamming_256(&sig_a_hi.hash, &sig_b_hi.hash);
             let base = zncc_score(&sig_a_hi, &sig_b_hi);
             let det = hires_detail_score(&sig_a_hi, &sig_b_hi);
+            let ts_b = win_start + (i as f64) * (1001.0 / 24000.0);
+            log_debug(&format!("      cand[{:02}] pts_b={:.4}s | hdiff={:3} | zncc={:.4} | det={:.4}", i, ts_b, hdiff, base, det));
             if best.map_or(true, |(_, _, _, best_d)| det > best_d) {
-                let ts_b = if let Some(&raw_pts) = pts_list.get(i) {
-                    if raw_pts < seek_pre * 0.5 { seek_pre + raw_pts } else { raw_pts }
-                } else {
-                    win_start + (i as f64) * 0.041708
-                };
                 best = Some((ts_b, hdiff, base, det));
             }
         }
@@ -615,9 +628,7 @@ fn extract_hires_frame(video: &Path, approx_ts: f64, ffmpeg: &Path) -> Option<(f
         return None;
     }
     let sig = compute_hires_sig(&output.stdout[..frame_bytes])?;
-    let raw_pts = parse_showinfo_pts(&output.stderr).into_iter().next().unwrap_or(seek_post);
-    let exact_ts = if raw_pts < seek_pre * 0.5 { seek_pre + raw_pts } else { raw_pts };
-    Some((exact_ts, sig))
+    Some((approx_ts, sig))
 }
 
 fn compute_hires_sig(raw_gray: &[u8]) -> Option<FrameSig> {
@@ -736,8 +747,13 @@ fn run_comparison(
 ) -> Result<PathBuf, String> {
     let ffmpeg = find_ffmpeg()?;
 
+    let _ = std::fs::write("search_debug.log", "");
     let dur_a = get_duration(&file_a, &ffmpeg);
     let dur_b = get_duration(&file_b, &ffmpeg);
+    log_debug(&format!("=== START COMPARISON ==="));
+    log_debug(&format!("File A: {:?} (dur={:.3}s)", file_a, dur_a));
+    log_debug(&format!("File B: {:?} (dur={:.3}s)", file_b, dur_b));
+    log_debug(&format!("Params: from={:.2}s to={:.2}s samples={} count={} window={:.2}s", from_sec, to_sec, samples, count, window_sec));
 
     let start_a = from_sec.min(dur_a);
     let end_a = to_sec.min(dur_a);
@@ -785,17 +801,22 @@ fn run_comparison(
             let end_b = (center_b + win).min(dur_b);
             let span_b = (end_b - start_b).max(0.2);
 
-            if let Some((approx_ts_b, coarse_hdiff, coarse_zncc, _)) =
+            log_debug(&format!("Point #{:02} (ts_a={:.4}s) -> searching window {:.2}..{:.2}s (delta={:?})", idx + 1, ts_a, start_b, end_b, current_delta));
+            if let Some((approx_ts_b, coarse_hdiff, coarse_zncc, coarse_det, f_cnt)) =
                 find_best_match_in_window(&file_b, start_b, span_b, sig_a, &ffmpeg)
             {
+                log_debug(&format!("    [coarse HIT] frames={} approx_ts_b={:.4}s hdiff={} zncc={:.4} det={:.4}", f_cnt, approx_ts_b, coarse_hdiff, coarse_zncc, coarse_det));
                 if coarse_zncc >= 0.78 && coarse_hdiff <= 64 {
                     if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
                         refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
                     {
                         if hi_zncc >= 0.78 && hi_hdiff <= 64 {
+                            log_debug(&format!("    >>> ACCEPTED PAIR: A={:.4}s B={:.4}s (delta={:.3}s) hi_hdiff={} hi_zncc={:.4} hi_det={:.4}", exact_a, exact_b, exact_b - exact_a, hi_hdiff, hi_zncc, hi_det));
                             matches.push((exact_a, exact_b, hi_hdiff, hi_det));
                             current_delta = Some(exact_b - exact_a);
                             break;
+                        } else {
+                            log_debug(&format!("    xxx REJECTED BY REFINE THRESHOLD: hi_zncc={:.4} hi_hdiff={}", hi_zncc, hi_hdiff));
                         }
                     }
                 }
