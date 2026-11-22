@@ -720,21 +720,21 @@ fn hires_detail_score(a: &FrameSig, b: &FrameSig) -> f32 {
 fn save_window_frame_png(video: &Path, win_start: f64, frame_idx: usize, out: &Path, ffmpeg: &Path) -> bool {
     let seek_pre = (win_start - 1.5).max(0.0);
     let seek_post = (win_start - seek_pre).max(0.0);
+    let vf = format!("trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS", frame_idx, frame_idx + 1);
     let status = create_hidden_cmd(ffmpeg)
         .args([
             "-y",
             "-ss", &format!("{:.4}", seek_pre),
             "-i", &video.to_string_lossy(),
             "-ss", &format!("{:.4}", seek_post),
-            "-vf", &format!(r"select=eq(n\,{})", frame_idx),
-            "-vsync", "0",
+            "-vf", &vf,
             "-frames:v", "1",
             "-c:v", "png",
             &out.to_string_lossy(),
         ])
         .status();
 
-    matches!(status, Ok(s) if s.success())
+    matches!(status, Ok(s) if s.success()) && out.exists()
 }
 
 fn save_frame_png(video: &Path, exact_pts: f64, out: &Path, ffmpeg: &Path) -> bool {
