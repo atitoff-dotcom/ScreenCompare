@@ -493,9 +493,9 @@ fn find_best_match_in_window(
 
         if let Some(sig_b) = compute_frame_sig(&buf) {
             let hdiff = hamming_256(&sig_a.hash, &sig_b.hash);
-            if hdiff <= 48 {
+            if hdiff <= 56 {
                 let base_zncc = zncc_score(sig_a, &sig_b);
-                if base_zncc >= 0.88 {
+                if base_zncc >= 0.83 {
                     let det = detail_score(sig_a, &sig_b);
                     if best_match.map_or(true, |(_, _, _, best_d)| det > best_d) {
                         best_match = Some((approx_ts, hdiff, base_zncc, det));
@@ -771,15 +771,16 @@ fn run_comparison(
         let end_b = (est_b + window_sec).min(dur_b);
         let span_b = (end_b - start_b).max(0.2);
 
-        if let Some((approx_ts_b, _, _, _)) =
+        if let Some((approx_ts_b, coarse_hdiff, coarse_zncc, _)) =
             find_best_match_in_window(&file_b, start_b, span_b, sig_a, &ffmpeg)
         {
-            // Второй проход: сравниваем левый и правый кадры на сетке 320x320 по соседним кадрам
-            if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
-                refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
-            {
-                if hi_zncc >= 0.91 && hi_hdiff <= 34 {
-                    matches.push((exact_a, exact_b, hi_hdiff, hi_det));
+            if coarse_zncc >= 0.85 && coarse_hdiff <= 48 {
+                if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
+                    refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
+                {
+                    if hi_zncc >= 0.80 && hi_hdiff <= 56 {
+                        matches.push((exact_a, exact_b, hi_hdiff, hi_det));
+                    }
                 }
             }
         }
