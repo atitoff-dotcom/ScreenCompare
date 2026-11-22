@@ -493,9 +493,9 @@ fn find_best_match_in_window(
 
         if let Some(sig_b) = compute_frame_sig(&buf) {
             let hdiff = hamming_256(&sig_a.hash, &sig_b.hash);
-            if hdiff <= 56 {
+            if hdiff <= 68 {
                 let base_zncc = zncc_score(sig_a, &sig_b);
-                if base_zncc >= 0.83 {
+                if base_zncc >= 0.76 {
                     let det = detail_score(sig_a, &sig_b);
                     if best_match.map_or(true, |(_, _, _, best_d)| det > best_d) {
                         best_match = Some((approx_ts, hdiff, base_zncc, det));
@@ -764,22 +764,39 @@ fn run_comparison(
     let _ = tx.send(WorkerMsg::Status("Покадровый поиск и высокоточная сверка пар...".to_string()));
     let rate_guess = if dur_a > 0.0 { dur_b / dur_a } else { 1.0 };
     let mut matches: Vec<(f64, f64, u32, f32)> = Vec::new();
+    let mut current_delta: Option<f64> = None;
 
     for (idx, (ts_a, sig_a)) in points_a.iter().enumerate() {
-        let est_b = ts_a * rate_guess;
-        let start_b = (est_b - window_sec).max(0.0);
-        let end_b = (est_b + window_sec).min(dur_b);
-        let span_b = (end_b - start_b).max(0.2);
+        let primary_center = match current_delta {
+            Some(d) => (ts_a + d).clamp(0.0, dur_b),
+            None => (ts_a * rate_guess).clamp(0.0, dur_b),
+        };
 
-        if let Some((approx_ts_b, coarse_hdiff, coarse_zncc, _)) =
-            find_best_match_in_window(&file_b, start_b, span_b, sig_a, &ffmpeg)
-        {
-            if coarse_zncc >= 0.85 && coarse_hdiff <= 48 {
-                if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
-                    refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
-                {
-                    if hi_zncc >= 0.80 && hi_hdiff <= 56 {
-                        matches.push((exact_a, exact_b, hi_hdiff, hi_det));
+        // Сначала ищем в основном окне вокруг текущего сдвига, при неудаче — в расширенном окне (на случай вырезанных/добавленных сцен)
+        let mut search_windows = vec![(primary_center, window_sec)];
+        let fallback_center = (ts_a * rate_guess).clamp(0.0, dur_b);
+        if (fallback_center - primary_center).abs() > window_sec * 0.5 {
+            search_windows.push((fallback_center, window_sec * 1.5));
+        }
+        search_windows.push((primary_center, (window_sec * 4.0).max(60.0)));
+
+        for (center_b, win) in search_windows {
+            let start_b = (center_b - win).max(0.0);
+            let end_b = (center_b + win).min(dur_b);
+            let span_b = (end_b - start_b).max(0.2);
+
+            if let Some((approx_ts_b, coarse_hdiff, coarse_zncc, _)) =
+                find_best_match_in_window(&file_b, start_b, span_b, sig_a, &ffmpeg)
+            {
+                if coarse_zncc >= 0.78 && coarse_hdiff <= 64 {
+                    if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
+                        refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
+                    {
+                        if hi_zncc >= 0.78 && hi_hdiff <= 64 {
+                            matches.push((exact_a, exact_b, hi_hdiff, hi_det));
+                            current_delta = Some(exact_b - exact_a);
+                            break;
+                        }
                     }
                 }
             }
