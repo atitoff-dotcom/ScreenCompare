@@ -556,7 +556,7 @@ fn refine_exact_match(
     file_b: &Path,
     approx_ts_b: f64,
     ffmpeg: &Path,
-) -> Option<(f64, f64, u32, f32, f32)> {
+) -> Option<(f64, f64, f64, usize, u32, f32, f32)> {
     // Извлекаем высокодетальный кадр А (320x320) и его точный PTS
     let (exact_ts_a, sig_a_hi) = extract_hires_frame(file_a, ts_a, ffmpeg)?;
 
@@ -584,9 +584,9 @@ fn refine_exact_match(
     if count == 0 {
         return None;
     }
-    let pts_list = parse_showinfo_pts(&output.stderr);
+    let _pts_list = parse_showinfo_pts(&output.stderr);
 
-    let mut best: Option<(f64, u32, f32, f32)> = None;
+    let mut best: Option<(f64, usize, u32, f32, f32)> = None;
     log_debug(&format!("    [refine 320x320] exact_ts_a={:.4}s | candidates={}:", exact_ts_a, count));
     for i in 0..count {
         let slice = &output.stdout[i * frame_bytes..(i + 1) * frame_bytes];
@@ -596,14 +596,14 @@ fn refine_exact_match(
             let det = hires_detail_score(&sig_a_hi, &sig_b_hi);
             let ts_b = win_start + (i as f64) * (1001.0 / 24000.0);
             log_debug(&format!("      cand[{:02}] pts_b={:.4}s | hdiff={:3} | zncc={:.4} | det={:.4}", i, ts_b, hdiff, base, det));
-            if best.map_or(true, |(_, _, _, best_d)| det > best_d) {
-                best = Some((ts_b, hdiff, base, det));
+            if best.map_or(true, |(_, _, _, _, best_d)| det > best_d) {
+                best = Some((ts_b, i, hdiff, base, det));
             }
         }
     }
 
-    let (best_ts_b, hdiff, base, det) = best?;
-    Some((exact_ts_a, best_ts_b, hdiff, base, det))
+    let (best_ts_b, best_idx, hdiff, base, det) = best?;
+    Some((exact_ts_a, best_ts_b, win_start, best_idx, hdiff, base, det))
 }
 
 fn extract_hires_frame(video: &Path, approx_ts: f64, ffmpeg: &Path) -> Option<(f64, FrameSig)> {
@@ -717,6 +717,26 @@ fn hires_detail_score(a: &FrameSig, b: &FrameSig) -> f32 {
     0.45 * base + 0.55 * edge_corr
 }
 
+fn save_window_frame_png(video: &Path, win_start: f64, frame_idx: usize, out: &Path, ffmpeg: &Path) -> bool {
+    let seek_pre = (win_start - 1.5).max(0.0);
+    let seek_post = (win_start - seek_pre).max(0.0);
+    let status = create_hidden_cmd(ffmpeg)
+        .args([
+            "-y",
+            "-ss", &format!("{:.4}", seek_pre),
+            "-i", &video.to_string_lossy(),
+            "-ss", &format!("{:.4}", seek_post),
+            "-vf", &format!(r"select=eq(n\,{})", frame_idx),
+            "-vsync", "0",
+            "-frames:v", "1",
+            "-c:v", "png",
+            &out.to_string_lossy(),
+        ])
+        .status();
+
+    matches!(status, Ok(s) if s.success())
+}
+
 fn save_frame_png(video: &Path, exact_pts: f64, out: &Path, ffmpeg: &Path) -> bool {
     let seek_pre = (exact_pts - 1.5).max(0.0);
     let seek_post = (exact_pts - seek_pre).max(0.0);
@@ -779,7 +799,7 @@ fn run_comparison(
 
     let _ = tx.send(WorkerMsg::Status("Покадровый поиск и высокоточная сверка пар...".to_string()));
     let rate_guess = if dur_a > 0.0 { dur_b / dur_a } else { 1.0 };
-    let mut matches: Vec<(f64, f64, u32, f32)> = Vec::new();
+    let mut matches: Vec<(f64, f64, f64, usize, u32, f32)> = Vec::new();
     let mut current_delta: Option<f64> = None;
 
     for (idx, (ts_a, sig_a)) in points_a.iter().enumerate() {
@@ -807,12 +827,12 @@ fn run_comparison(
             {
                 log_debug(&format!("    [coarse HIT] frames={} approx_ts_b={:.4}s hdiff={} zncc={:.4} det={:.4}", f_cnt, approx_ts_b, coarse_hdiff, coarse_zncc, coarse_det));
                 if coarse_zncc >= 0.78 && coarse_hdiff <= 64 {
-                    if let Some((exact_a, exact_b, hi_hdiff, hi_zncc, hi_det)) =
+                    if let Some((exact_a, exact_b, win_start_b, best_idx_b, hi_hdiff, hi_zncc, hi_det)) =
                         refine_exact_match(&file_a, *ts_a, &file_b, approx_ts_b, &ffmpeg)
                     {
                         if hi_zncc >= 0.78 && hi_hdiff <= 64 {
-                            log_debug(&format!("    >>> ACCEPTED PAIR: A={:.4}s B={:.4}s (delta={:.3}s) hi_hdiff={} hi_zncc={:.4} hi_det={:.4}", exact_a, exact_b, exact_b - exact_a, hi_hdiff, hi_zncc, hi_det));
-                            matches.push((exact_a, exact_b, hi_hdiff, hi_det));
+                            log_debug(&format!("    >>> ACCEPTED PAIR: A={:.4}s B={:.4}s (idx={}) (delta={:.3}s) hi_hdiff={} hi_zncc={:.4} hi_det={:.4}", exact_a, exact_b, best_idx_b, exact_b - exact_a, hi_hdiff, hi_zncc, hi_det));
+                            matches.push((exact_a, exact_b, win_start_b, best_idx_b, hi_hdiff, hi_det));
                             current_delta = Some(exact_b - exact_a);
                             break;
                         } else {
@@ -837,7 +857,7 @@ fn run_comparison(
         return Err("Точных совпадений не найдено (непохожие кадры отсеяны). Попробуйте увеличить окно поиска или число точек.".to_string());
     }
 
-    matches.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    matches.sort_by(|a, b| b.5.partial_cmp(&a.5).unwrap_or(std::cmp::Ordering::Equal));
     matches.truncate(count);
     matches.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -855,13 +875,13 @@ fn run_comparison(
     tx.send(WorkerMsg::Status(format!("Экспорт {} точных пар PNG без сжатия...", matches.len())));
     let mut export_records = Vec::new();
 
-    for (i, &(ts_a, ts_b, diff, _score)) in matches.iter().enumerate() {
+    for (i, &(ts_a, ts_b, win_start_b, best_idx_b, diff, _score)) in matches.iter().enumerate() {
         let pair_id = i + 1;
         let fn_a = out_dir.join(format!("pair_{:02}_A.png", pair_id));
         let fn_b = out_dir.join(format!("pair_{:02}_B.png", pair_id));
 
         save_frame_png(&file_a, ts_a, &fn_a, &ffmpeg);
-        save_frame_png(&file_b, ts_b, &fn_b, &ffmpeg);
+        save_window_frame_png(&file_b, win_start_b, best_idx_b, &fn_b, &ffmpeg);
 
         export_records.push(MatchRecord {
             id: pair_id,
