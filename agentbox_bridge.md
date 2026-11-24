@@ -65,5 +65,5 @@
 * Your responses are monitored by a local Windows Clipboard Bridge.
 * To inspect files or run checks, output exact `agentbox ...` lines inside a single fenced code block (multiple commands on separate lines are executed sequentially in one pass).
 * To apply complex multi-file Python edits in one step, output a single fenced `python` block starting with `# FIX:` on the first line (avoid nested triple quotes inside the block).
-* **Max `# FIX:` payload size: <= 7500 characters** (web chat code blocks truncate around ~9000 chars). Split larger edits into sequential `# FIX:` steps.
+* **Max `# FIX:` payload size: <= 5500 characters** (web chat code blocks truncate around ~7000 chars). Split larger edits into sequential `# FIX:` steps.
 * Keep explanations concise so the user or bridge can act immediately.

@@ -1,7 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod history;
+mod uploaders;
+use uploaders::UploaderId;
+mod picker;
+use history::{poll_cloud_upload, render_history_window, start_cloud_upload, HistoryState};
+use picker::{build_pair_items, format_mb, render_pair_picker_viewport, selected_total_bytes, HTMLKIN_MAX_BYTES};
 use eframe::egui;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +24,7 @@ use std::os::windows::process::CommandExt;
 const DEFAULT_FFMPEG: &str = r"C:\Users\user\Programs\Video\eac3to\ffmpeg.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct MatchRecord {
     id: usize,
     time_a_sec: f64,
@@ -30,10 +37,12 @@ struct MatchRecord {
     file_b: String,
 }
 
+pub use picker::{PairItem, PickerState};
+
 enum WorkerMsg {
     Status(String),
     Progress(f32),
-    Done(Result<PathBuf, String>),
+    Done(Result<(PathBuf, Vec<MatchRecord>, String, String), String>),
 }
 
 #[derive(Clone)]
@@ -143,6 +152,9 @@ struct ScreenCompareApp {
     status_text: String,
     progress: f32,
     finished_html: Option<PathBuf>,
+    show_about: bool,
+    history: HistoryState,
+    picker: Arc<Mutex<PickerState>>,
 
     rx: Option<Receiver<WorkerMsg>>,
 }
@@ -161,6 +173,9 @@ impl Default for ScreenCompareApp {
             status_text: "Перетащите два видеофайла мышкой в окно программы...".to_string(),
             progress: 0.0,
             finished_html: None,
+            show_about: false,
+            history: HistoryState::load(),
+            picker: Arc::new(Mutex::new(PickerState::default())),
             rx: None,
         }
     }
@@ -190,6 +205,13 @@ impl eframe::App for ScreenCompareApp {
             }
         });
 
+        if let Some(res) = poll_cloud_upload(&mut self.history, ctx) {
+            match res {
+                Ok(url) => self.status_text = format!("✅ Загружено в облако (ссылка скопирована): {}", url),
+                Err(err) => self.status_text = format!("❌ {}", err),
+            }
+        }
+
         if let Some(ref rx) = self.rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -198,21 +220,64 @@ impl eframe::App for ScreenCompareApp {
                     WorkerMsg::Done(res) => {
                         self.is_running = false;
                         match res {
-                            Ok(html_path) => {
-                                self.status_text = "Готово! Сравнение завершено. matches.zip сформирован.".to_string();
+                            Ok((html_path, records, name_a, name_b)) => {
+                                self.status_text = format!("Найдено пар: {}. Отметьте нужные и нажмите «Сохранить выбранные» для создания ZIP.", records.len());
                                 self.finished_html = Some(html_path);
+                                if let Ok(mut st) = self.picker.lock() {
+                                    st.pairs = build_pair_items(records);
+                                    st.current_idx = 0;
+                                    st.show_b = false;
+                                    st.zoom = 1.0;
+                                    st.pan = egui::Vec2::ZERO;
+                                    st.name_a = name_a;
+                                    st.name_b = name_b;
+                                    st.textures.clear();
+                                    st.failed_loads.clear();
+                                    st.zip_created = false;
+                                    st.status_msg = "[Пробел]/клик — А/Б, [←/→] — пары, [Enter] — выбрать.".to_string();
+                                    st.is_open = !st.pairs.is_empty();
+                                }
                             }
-                            Err(e) => {
-                                self.status_text = format!("Ошибка: {}", e);
-                            }
+                            Err(e) => self.status_text = format!("Ошибка: {}", e),
                         }
                     }
                 }
             }
         }
 
+        let mut zip_status_ui: Option<(f32, String)> = None;
+        if let Ok(mut st) = self.picker.lock() {
+            let (in_prog, finished) = picker::poll_zip_job(&mut st);
+            zip_status_ui = in_prog;
+            if let Some(res) = finished {
+                match res {
+                    Ok(info) => {
+                        self.status_text = format!("✅ Архив matches.zip готов ({}).", format_mb(info.total_bytes));
+                        history::record_saved_report_ready(
+                            &mut self.history, &st.name_a, &st.name_b,
+                            info.pairs_count, info.total_bytes,
+                            info.stamp, info.human, info.zip_dest,
+                        );
+                    }
+                    Err(err) => {
+                        self.status_text = format!("❌ Ошибка сборки ZIP: {}", err);
+                    }
+                }
+            }
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("🎬 ScreenCompare: Поиск и блинк-сравнение кадров");
+            ui.horizontal(|ui| {
+                ui.heading("🎬 ScreenCompare: Поиск и блинк-сравнение кадров");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(" ℹ About ").clicked() {
+                        self.show_about = !self.show_about;
+                    }
+                    let hist_lbl = format!(" 📜 История ({}) ", self.history.entries.len());
+                    if ui.button(hist_lbl).clicked() {
+                        self.history.is_open = !self.history.is_open;
+                    }
+                });
+            });
             ui.add_space(6.0);
 
             ui.group(|ui| {
@@ -253,14 +318,10 @@ impl eframe::App for ScreenCompareApp {
 
                     ui.separator();
 
-                    ui.label("Точек:");
-                    ui.add(egui::DragValue::new(&mut self.samples).clamp_range(2..=200));
-
                     ui.label("Пар:");
-                    ui.add(egui::DragValue::new(&mut self.count).clamp_range(2..=100));
-
-                    ui.label("Окно (с):");
-                    ui.add(egui::DragValue::new(&mut self.window_sec).clamp_range(2.0..=120.0).speed(0.5));
+                    if ui.add(egui::DragValue::new(&mut self.count).clamp_range(2..=100)).changed() {
+                        self.samples = ((self.count as f32) * 1.5).round() as usize;
+                    }
                 });
             });
 
@@ -287,24 +348,91 @@ impl eframe::App for ScreenCompareApp {
                 }
 
                 if let Some(ref path) = self.finished_html {
-                    if ui.button(egui::RichText::new(" 🌐 Открыть отчет в браузере ").size(14.0)).clicked() {
-                        let _ = create_hidden_cmd("cmd").args(["/c", "start", "", &path.to_string_lossy()]).spawn();
+                    if path.exists() {
+                        if ui.button(egui::RichText::new(" 🔍 Выбрать пары (весь экран) ").strong().size(14.0).color(egui::Color32::from_rgb(255, 210, 90))).clicked() {
+                            if let Ok(mut st) = self.picker.lock() {
+                                if st.pairs.is_empty() {
+                                    if let Ok(js) = std::fs::read_to_string("matches/matches.json") {
+                                        if let Ok(recs) = serde_json::from_str::<Vec<MatchRecord>>(&js) {
+                                            st.pairs = build_pair_items(recs);
+                                            st.zoom = 1.0;
+                                            st.name_a = Path::new(&self.video_a).file_name().unwrap_or_default().to_string_lossy().to_string();
+                                            st.name_b = Path::new(&self.video_b).file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        }
+                                    }
+                                }
+                                st.is_open = true;
+                            }
+                        }
+                        if ui.button(egui::RichText::new(" 🌐 Открыть отчет в браузере ").size(14.0)).clicked() {
+                            let _ = create_hidden_cmd("cmd").args(["/c", "start", "", &path.to_string_lossy()]).spawn();
+                        }
                     }
-                    if ui.button(egui::RichText::new(" ☁ Загрузить ZIP на Tiiny Host ").size(14.0).color(egui::Color32::from_rgb(80, 200, 120))).clicked() {
-                        let _ = create_hidden_cmd("cmd").args(["/c", "start", "", "https://tiiny.host/"]).spawn();
+                    let total_bytes = self.picker.lock().map(|st| selected_total_bytes(&st.pairs)).unwrap_or(0);
+                    let zip_busy = zip_status_ui.is_some();
+                    let zip_ok = !zip_busy && Path::new("matches.zip").exists();
+                    let can_up = zip_ok && !self.history.uploading && total_bytes <= HTMLKIN_MAX_BYTES;
+                    egui::ComboBox::from_id_source("m_up")
+                        .selected_text(self.history.selected_uploader.short_name())
+                        .width(105.0)
+                        .show_ui(ui, |ui| {
+                            for &p in UploaderId::ALL {
+                                ui.selectable_value(&mut self.history.selected_uploader, p, p.label());
+                            }
+                        });
+                    let lbl_up = if self.history.uploading { " ⏳ Загрузка ZIP... " } else { " ☁ Загрузить ZIP в облако " };
+                    let btn = egui::Button::new(egui::RichText::new(lbl_up).size(14.0).color(if can_up { egui::Color32::from_rgb(80, 200, 120) } else { egui::Color32::GRAY }));
+                    let r = ui.add_enabled(can_up, btn);
+                    if !zip_ok {
+                        r.on_disabled_hover_text("Сначала выберите пары и создайте matches.zip.");
+                    } else if r.clicked() {
+                        match start_cloud_upload(&mut self.history, "matches.zip", Some(0)) {
+                            Ok(()) => { self.status_text = "⏳ Загрузка matches.zip на облако...".to_string(); }
+                            Err(err) => { self.status_text = err; }
+                        }
                     }
-                    if ui.button("📁 Показать файлы").clicked() {
-                        if let Some(parent) = path.parent() {
+                    if zip_ok {
+                        if ui.button("📁 Показать ZIP").clicked() {
+                            let _ = create_hidden_cmd("explorer").args(["/select,matches.zip"]).spawn();
+                        }
+                    } else if let Some(parent) = path.parent() {
+                        if parent.exists() && ui.button("📁 Показать файлы").clicked() {
                             let _ = create_hidden_cmd("explorer").arg(parent).spawn();
                         }
                     }
                 }
             });
 
-            if self.finished_html.is_some() {
+            if let Some((z_prog, ref z_lbl)) = zip_status_ui {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(z_lbl).color(egui::Color32::from_rgb(255, 220, 120)).size(13.0));
+                });
+                ui.add(egui::ProgressBar::new(z_prog).show_percentage());
+            } else if self.finished_html.is_some() {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("Архив matches.zip готов! Перетащите его на страницу tiiny.host для публикации.")
-                    .color(egui::Color32::from_rgb(180, 220, 180)).size(11.5));
+                let (zip_ready, total_bytes) = self.picker.lock().map(|st| (st.zip_created, selected_total_bytes(&st.pairs))).unwrap_or((false, 0));
+                if self.history.uploading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Идёт отправка matches.zip на файлообменник...").color(egui::Color32::from_rgb(160, 220, 255)).size(12.0));
+                    });
+                } else if let Some(url) = self.history.entries.first().map(|e| e.bugsmash_url.clone()).filter(|u| !u.is_empty()) {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Ссылка на архив:").color(egui::Color32::from_rgb(180, 220, 180)).size(12.0));
+                        ui.hyperlink_to(&url, &url);
+                        if ui.small_button("📋 Копировать").clicked() {
+                            ui.output_mut(|o| o.copied_text = url);
+                        }
+                    });
+                } else if zip_ready {
+                    ui.label(egui::RichText::new(format!("Архив matches.zip готов ({}). Нажмите «Загрузить ZIP в облако» для получения прямой ссылки.", format_mb(total_bytes)))
+                        .color(egui::Color32::from_rgb(180, 220, 180)).size(11.5));
+                } else {
+                    ui.label(egui::RichText::new("Откройте окно отбора пар, отметьте нужные кадры и нажмите «Сохранить выбранные», чтобы создать matches.zip.")
+                        .color(egui::Color32::from_rgb(245, 210, 120)).size(11.5));
+                }
             }
 
             ui.add_space(6.0);
@@ -313,7 +441,63 @@ impl eframe::App for ScreenCompareApp {
                 .weak().size(11.0));
         });
 
-        if self.is_running {
+        render_history_window(ctx, &mut self.history);
+
+        if self.show_about {
+            let mut open = self.show_about;
+            egui::Window::new("О программе — ScreenCompare")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(380.0);
+                    ui.heading(format!("🎬 ScreenCompare v{}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(4.0);
+                    ui.label("Утилита точного поиска совпадающих кадров между двумя видеорелизами, визуального блинк-сравнения и генерации веб-отчётов.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Автор / связь:").strong());
+                        ui.hyperlink_to("a.tit.off@gmail.com", "mailto:a.tit.off@gmail.com");
+                        if ui.small_button("📋 Копировать").clicked() {
+                            ui.output_mut(|o| o.copied_text = "a.tit.off@gmail.com".to_string());
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Горячие клавиши в окне отбора пар:").strong());
+                    ui.label("• Пробел / клик по кадру — переключить Кадр А / Кадр Б");
+                    ui.label("• ← / → — переход между парами");
+                    ui.label("• Enter — включить / исключить пару из отчёта");
+                    ui.label("• Колесо мыши / двойной клик — масштаб 50%–800% / сброс");
+                    ui.label("• Esc — закрыть окно отбора");
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Закрыть").clicked() {
+                            self.show_about = false;
+                        }
+                    });
+                });
+            if !open {
+                self.show_about = false;
+            }
+        }
+
+        let picker_vp_id = egui::ViewportId::from_hash_of("pair_picker_fullscreen");
+        if self.picker.lock().map(|st| st.is_open).unwrap_or(false) {
+            let picker_arc = Arc::clone(&self.picker);
+            ctx.show_viewport_deferred(
+                picker_vp_id,
+                egui::ViewportBuilder::default()
+                    .with_title("ScreenCompare — Полноэкранный отбор пар (A / B)")
+                    .with_maximized(true),
+                move |ctx, _class| render_pair_picker_viewport(ctx, &picker_arc),
+            );
+        } else {
+            ctx.send_viewport_cmd_to(picker_vp_id, egui::ViewportCommand::Close);
+        }
+
+        if self.is_running || zip_status_ui.is_some() {
             ctx.request_repaint();
         }
     }
@@ -321,6 +505,7 @@ impl eframe::App for ScreenCompareApp {
 
 impl ScreenCompareApp {
     fn start_processing(&mut self) {
+        self.samples = ((self.count as f32) * 1.5).round() as usize;
         self.is_running = true;
         self.progress = 0.0;
         self.status_text = "Запуск фонового процесса...".to_string();
@@ -717,11 +902,15 @@ fn hires_detail_score(a: &FrameSig, b: &FrameSig) -> f32 {
     0.45 * base + 0.55 * edge_corr
 }
 
+fn is_valid_png(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.len() > 1024).unwrap_or(false)
+}
+
 fn save_window_frame_png(video: &Path, win_start: f64, frame_idx: usize, out: &Path, ffmpeg: &Path) -> bool {
     let seek_pre = (win_start - 1.5).max(0.0);
     let seek_post = (win_start - seek_pre).max(0.0);
-    let vf = format!("trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS", frame_idx, frame_idx + 1);
-    let status = create_hidden_cmd(ffmpeg)
+    let vf = format!("trim=start_frame={}:end_frame={},setpts=PTS-STARTPTS,format=rgb24", frame_idx, frame_idx + 1);
+    let res = create_hidden_cmd(ffmpeg)
         .args([
             "-y",
             "-ss", &format!("{:.4}", seek_pre),
@@ -732,27 +921,48 @@ fn save_window_frame_png(video: &Path, win_start: f64, frame_idx: usize, out: &P
             "-c:v", "png",
             &out.to_string_lossy(),
         ])
-        .status();
+        .output();
 
-    matches!(status, Ok(s) if s.success()) && out.exists()
+    match res {
+        Ok(o) if o.status.success() && is_valid_png(out) => true,
+        Ok(o) => {
+            log_debug(&format!("save_window_frame_png failed for {:?}: status={:?}, stderr={}", out, o.status.code(), String::from_utf8_lossy(&o.stderr)));
+            false
+        }
+        Err(e) => {
+            log_debug(&format!("save_window_frame_png spawn err for {:?}: {}", out, e));
+            false
+        }
+    }
 }
 
 fn save_frame_png(video: &Path, exact_pts: f64, out: &Path, ffmpeg: &Path) -> bool {
     let seek_pre = (exact_pts - 1.5).max(0.0);
     let seek_post = (exact_pts - seek_pre).max(0.0);
-    let status = create_hidden_cmd(ffmpeg)
+    let res = create_hidden_cmd(ffmpeg)
         .args([
             "-y",
             "-ss", &format!("{:.4}", seek_pre),
             "-i", &video.to_string_lossy(),
             "-ss", &format!("{:.4}", seek_post),
+            "-vf", "format=rgb24",
             "-frames:v", "1",
             "-c:v", "png",
             &out.to_string_lossy(),
         ])
-        .status();
+        .output();
 
-    matches!(status, Ok(s) if s.success())
+    match res {
+        Ok(o) if o.status.success() && is_valid_png(out) => true,
+        Ok(o) => {
+            log_debug(&format!("save_frame_png failed for {:?}: status={:?}, stderr={}", out, o.status.code(), String::from_utf8_lossy(&o.stderr)));
+            false
+        }
+        Err(e) => {
+            log_debug(&format!("save_frame_png spawn err for {:?}: {}", out, e));
+            false
+        }
+    }
 }
 
 fn run_comparison(
@@ -764,7 +974,7 @@ fn run_comparison(
     samples: usize,
     window_sec: f64,
     tx: &Sender<WorkerMsg>,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Vec<MatchRecord>, String, String), String> {
     let ffmpeg = find_ffmpeg()?;
 
     let _ = std::fs::write("search_debug.log", "");
@@ -844,13 +1054,18 @@ fn run_comparison(
         }
 
         let p = 0.30 + (idx + 1) as f32 / points_a.len() as f32 * 0.50;
-        tx.send(WorkerMsg::Progress(p));
-        tx.send(WorkerMsg::Status(format!(
-            "Обработано точек: {}/{} | Точных пар: {}",
+        let _ = tx.send(WorkerMsg::Progress(p));
+        let _ = tx.send(WorkerMsg::Status(format!(
+            "Обработано точек: {}/{} | Найдено пар: {}/{}",
             idx + 1,
             points_a.len(),
-            matches.len()
+            matches.len(),
+            count
         )));
+        if matches.len() >= count {
+            log_debug(&format!("Reached target count={} pairs, stopping search early.", count));
+            break;
+        }
     }
 
     if matches.is_empty() {
@@ -880,8 +1095,14 @@ fn run_comparison(
         let fn_a = out_dir.join(format!("pair_{:02}_A.png", pair_id));
         let fn_b = out_dir.join(format!("pair_{:02}_B.png", pair_id));
 
-        save_frame_png(&file_a, ts_a, &fn_a, &ffmpeg);
-        save_window_frame_png(&file_b, win_start_b, best_idx_b, &fn_b, &ffmpeg);
+        let ok_a = save_frame_png(&file_a, ts_a, &fn_a, &ffmpeg);
+        let ok_b = if save_window_frame_png(&file_b, win_start_b, best_idx_b, &fn_b, &ffmpeg) {
+            true
+        } else {
+            log_debug(&format!("Falling back to save_frame_png for pair {} B at ts_b={:.4}", pair_id, ts_b));
+            save_frame_png(&file_b, ts_b, &fn_b, &ffmpeg)
+        };
+        log_debug(&format!("Export pair {:02}: ok_a={} ({:?}) ok_b={} ({:?})", pair_id, ok_a, fn_a, ok_b, fn_b));
 
         export_records.push(MatchRecord {
             id: pair_id,
@@ -910,29 +1131,10 @@ fn run_comparison(
     std::fs::write(&html_path, &html_code);
     let _ = std::fs::write(out_dir.join("viewer.html"), &html_code);
 
-    tx.send(WorkerMsg::Status("Упаковка в matches.zip...".to_string()));
-    let zip_path = PathBuf::from("matches.zip");
-    if let Ok(f) = File::create(&zip_path) {
-        let mut zip = ZipWriter::new(BufWriter::new(f));
-        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let _ = std::fs::remove_file("matches.zip");
+    let _ = tx.send(WorkerMsg::Status("Кадры извлечены. Выберите нужные пары для сборки ZIP.".to_string()));
 
-        if let Ok(entries) = std::fs::read_dir(&out_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path.file_name().unwrap().to_string_lossy();
-                    if zip.start_file(name.as_ref(), opts).is_ok() {
-                        if let Ok(bytes) = std::fs::read(&path) {
-                            let _ = zip.write_all(&bytes);
-                        }
-                    }
-                }
-            }
-        }
-        let _ = zip.finish();
-    }
-
-    Ok(html_path)
+    Ok((html_path, export_records, name_a.to_string(), name_b.to_string()))
 }
 
 fn generate_html(data_json: &str, name_a: &str, name_b: &str) -> String {
@@ -1187,12 +1389,30 @@ fn generate_html(data_json: &str, name_a: &str, name_b: &str) -> String {
 "##, data_json = data_json, name_a = name_a, name_b = name_b)
 }
 
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/icon.png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes.as_slice()));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    Some(egui::IconData {
+        rgba: buf,
+        width: info.width,
+        height: info.height,
+    })
+}
+
 fn main() -> eframe::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([720.0, 480.0])
+        .with_min_inner_size([640.0, 420.0])
+        .with_drag_and_drop(true);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 480.0])
-            .with_min_inner_size([640.0, 420.0])
-            .with_drag_and_drop(true),
+        viewport,
         ..Default::default()
     };
 

@@ -1,18 +1,25 @@
 # Rust build artifacts
 /target/
-**/*.rs.bk
-*.pdb
 *.exe
+*.old
+*.new
+*.pdb
 
-# Generated output & archives
-/matches/
+# Logs & temporary files
+*.log
 matches.zip
 
-# OS & Editor temporary files
-.DS_Store
-Thumbs.db
-desktop.ini
-*.log
-*.tmp
+# User data & history
+/history/
+history.json
+
+# AgentBox protocol files
+agentbox.md
+agentbox_bridge.md
+.agentbox.json
+
+# IDE and OS files
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
