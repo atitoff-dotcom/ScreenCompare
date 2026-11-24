@@ -1,4 +1,4 @@
-use crate::uploaders::{github_pages::{cleanup_old_reports, GitHubPagesConfig}, make_http_agent, upload_with_provider, UploaderId};
+use crate::uploaders::{upload_with_provider, UploaderId};
 use crate::create_hidden_cmd;
 use crate::picker::format_mb;
 use eframe::egui;
@@ -27,8 +27,6 @@ pub struct HistoryState {
     pub status_msg: String,
     pub uploading: bool,
     pub selected_uploader: UploaderId,
-    pub gh_cfg: GitHubPagesConfig,
-    pub show_gh_settings: bool,
     pub upload_rx: Option<Receiver<(Option<usize>, Result<String, String>)>>,
 }
 
@@ -38,7 +36,7 @@ impl HistoryState {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Self { entries, gh_cfg: GitHubPagesConfig::load(), ..Default::default() }
+        Self { entries, ..Default::default() }
     }
 }
 
@@ -146,44 +144,9 @@ pub fn render_history_window(ctx: &egui::Context, st: &mut HistoryState) {
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Куда публиковать:");
-                egui::ComboBox::from_id_source("h_up")
-                    .selected_text(st.selected_uploader.label())
-                    .show_ui(ui, |ui| {
-                        for &p in UploaderId::ALL {
-                            ui.selectable_value(&mut st.selected_uploader, p, p.label());
-                        }
-                    });
-                if ui.button("⚙ GitHub Pages").clicked() {
-                    st.show_gh_settings = !st.show_gh_settings;
-                }
+                ui.label("Облако:");
+                ui.strong("WDfiles.ru (до 2 ГБ)");
             });
-            if st.show_gh_settings {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Репозиторий:");
-                        ui.add(egui::TextEdit::singleline(&mut st.gh_cfg.repo).desired_width(210.0));
-                        ui.label("Хранить (дней):");
-                        ui.add(egui::DragValue::new(&mut st.gh_cfg.retention_days).clamp_range(1..=365));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("GitHub Token:");
-                        ui.add(egui::TextEdit::singleline(&mut st.gh_cfg.token).password(true).desired_width(260.0));
-                        if ui.button("💾 Сохранить").clicked() {
-                            st.gh_cfg.save();
-                            st.status_msg = "✅ Настройки GitHub Pages сохранены.".to_string();
-                        }
-                        if ui.button("🧹 Очистить старые").clicked() {
-                            st.gh_cfg.save();
-                            let agent = make_http_agent();
-                            match cleanup_old_reports(&agent, &st.gh_cfg, false) {
-                                Ok(m) => st.status_msg = format!("✅ {}", m),
-                                Err(e) => st.status_msg = format!("❌ {}", e),
-                            }
-                        }
-                    });
-                });
-            }
             ui.separator();
             if !st.status_msg.is_empty() {
                 ui.horizontal(|ui| {

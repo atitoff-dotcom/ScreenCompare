@@ -1,26 +1,15 @@
 pub mod wdfiles;
-pub mod github_pages;
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum UploaderId { #[default] GitHubPages, WdFiles }
+pub enum UploaderId { #[default] WdFiles }
 
 impl UploaderId {
-    pub const ALL: &'static [UploaderId] = &[UploaderId::GitHubPages, UploaderId::WdFiles];
-    pub fn label(self) -> &'static str {
-        match self {
-            UploaderId::GitHubPages => "GitHub Pages (Веб-отчёт)",
-            UploaderId::WdFiles => "WDfiles.ru (ZIP, до 2 ГБ)",
-        }
-    }
     pub fn short_name(self) -> &'static str {
-        match self {
-            UploaderId::GitHubPages => "GitHub Pages",
-            UploaderId::WdFiles => "WDfiles.ru",
-        }
+        "WDfiles.ru"
     }
 }
 
@@ -29,11 +18,8 @@ pub trait CloudUploader {
     fn upload(&self, zip_file: &str) -> Result<String, String>;
 }
 
-pub fn get_uploader(id: UploaderId) -> Box<dyn CloudUploader> {
-    match id {
-        UploaderId::GitHubPages => Box::new(github_pages::GitHubPagesUploader),
-        UploaderId::WdFiles => Box::new(wdfiles::WdFilesUploader),
-    }
+pub fn get_uploader(_id: UploaderId) -> Box<dyn CloudUploader> {
+    Box::new(wdfiles::WdFilesUploader)
 }
 
 pub fn make_http_agent() -> ureq::Agent {

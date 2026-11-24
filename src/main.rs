@@ -2,7 +2,6 @@
 
 mod history;
 mod uploaders;
-use uploaders::UploaderId;
 mod picker;
 mod updater;
 use updater::{cleanup_old_binary, render_header_button, render_updater_window, UpdaterState};
@@ -377,15 +376,7 @@ impl eframe::App for ScreenCompareApp {
                     let zip_busy = zip_status_ui.is_some();
                     let zip_ok = !zip_busy && Path::new("matches.zip").exists();
                     let can_up = zip_ok && !self.history.uploading && total_bytes <= HTMLKIN_MAX_BYTES;
-                    egui::ComboBox::from_id_source("m_up")
-                        .selected_text(self.history.selected_uploader.short_name())
-                        .width(115.0)
-                        .show_ui(ui, |ui| {
-                            for &p in UploaderId::ALL {
-                                ui.selectable_value(&mut self.history.selected_uploader, p, p.label());
-                            }
-                        });
-                    let lbl_up = if self.history.uploading { " ⏳ Публикация... " } else { " ☁ Опубликовать отчёт " };
+                    let lbl_up = if self.history.uploading { " ⏳ Загрузка на WDfiles.ru... " } else { " ☁ Загрузить ZIP на WDfiles.ru " };
                     let btn = egui::Button::new(egui::RichText::new(lbl_up).size(14.0).color(if can_up { egui::Color32::from_rgb(80, 200, 120) } else { egui::Color32::GRAY }));
                     let r = ui.add_enabled(can_up, btn);
                     if !zip_ok {
