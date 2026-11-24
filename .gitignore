@@ -12,6 +12,7 @@ matches.zip
 # User data & history
 /history/
 history.json
+github_pages.json
 
 # AgentBox protocol files
 agentbox.md
