@@ -1,7 +1,10 @@
 pub mod wdfiles;
 pub mod tmpfiles;
 pub mod zero_x0;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Cursor, Read, Write};
+use std::path::Path;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum UploaderId { #[default] WdFiles, TmpFiles, ZeroX0 }
@@ -34,6 +37,65 @@ pub fn get_uploader(id: UploaderId) -> Box<dyn CloudUploader> {
         UploaderId::WdFiles => Box::new(wdfiles::WdFilesUploader),
         UploaderId::TmpFiles => Box::new(tmpfiles::TmpFilesUploader),
         UploaderId::ZeroX0 => Box::new(zero_x0::ZeroX0Uploader),
+    }
+}
+
+pub fn make_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(300))
+        .timeout_write(Duration::from_secs(300))
+        .build()
+}
+
+pub fn post_multipart_file(
+    agent: &ureq::Agent,
+    url: &str,
+    extra_headers: &[(&str, &str)],
+    fields: &[(&str, &str)],
+    file_field: &str,
+    file_path: &str,
+) -> Result<(u16, String), String> {
+    let boundary = format!("----ScreenCompareBoundary{}", std::process::id());
+    let file = File::open(file_path).map_err(|e| format!("Файл не открыт: {}", e))?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+    let filename = Path::new(file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("report.zip");
+
+    let mut head = Vec::new();
+    for (k, v) in fields {
+        let _ = write!(head, "--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n", boundary, k, v);
+    }
+    let _ = write!(
+        head,
+        "--{}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: application/zip\r\n\r\n",
+        boundary, file_field, filename
+    );
+    let tail = format!("\r\n--{}--\r\n", boundary).into_bytes();
+    let total_len = head.len() as u64 + file_len + tail.len() as u64;
+
+    let mut req = agent
+        .post(url)
+        .set("Content-Type", &format!("multipart/form-data; boundary={}", boundary))
+        .set("Content-Length", &total_len.to_string());
+    for (hk, hv) in extra_headers {
+        req = req.set(hk, hv);
+    }
+
+    let reader = Cursor::new(head).chain(file).chain(Cursor::new(tail));
+    match req.send(reader) {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.into_string().unwrap_or_default();
+            Ok((status, body))
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            Ok((code, body))
+        }
+        Err(e) => Err(format!("HTTP ошибка: {}", e)),
     }
 }
 

@@ -4,6 +4,8 @@ mod history;
 mod uploaders;
 use uploaders::UploaderId;
 mod picker;
+mod updater;
+use updater::{cleanup_old_binary, render_header_button, render_updater_window, UpdaterState};
 use history::{poll_cloud_upload, render_history_window, start_cloud_upload, HistoryState};
 use picker::{build_pair_items, format_mb, render_pair_picker_viewport, selected_total_bytes, HTMLKIN_MAX_BYTES};
 use eframe::egui;
@@ -155,6 +157,7 @@ struct ScreenCompareApp {
     show_about: bool,
     history: HistoryState,
     picker: Arc<Mutex<PickerState>>,
+    updater: UpdaterState,
 
     rx: Option<Receiver<WorkerMsg>>,
 }
@@ -176,6 +179,7 @@ impl Default for ScreenCompareApp {
             show_about: false,
             history: HistoryState::load(),
             picker: Arc::new(Mutex::new(PickerState::default())),
+            updater: UpdaterState::default(),
             rx: None,
         }
     }
@@ -204,6 +208,8 @@ impl eframe::App for ScreenCompareApp {
                 }
             }
         });
+
+        self.updater.poll(ctx);
 
         if let Some(res) = poll_cloud_upload(&mut self.history, ctx) {
             match res {
@@ -272,6 +278,7 @@ impl eframe::App for ScreenCompareApp {
                     if ui.button(" ℹ About ").clicked() {
                         self.show_about = !self.show_about;
                     }
+                    render_header_button(ui, &mut self.updater);
                     let hist_lbl = format!(" 📜 История ({}) ", self.history.entries.len());
                     if ui.button(hist_lbl).clicked() {
                         self.history.is_open = !self.history.is_open;
@@ -483,6 +490,8 @@ impl eframe::App for ScreenCompareApp {
             }
         }
 
+        render_updater_window(ctx, &mut self.updater);
+
         let picker_vp_id = egui::ViewportId::from_hash_of("pair_picker_fullscreen");
         if self.picker.lock().map(|st| st.is_open).unwrap_or(false) {
             let picker_arc = Arc::clone(&self.picker);
@@ -530,21 +539,22 @@ impl ScreenCompareApp {
 }
 
 fn find_ffmpeg() -> Result<PathBuf, String> {
-    if Path::new(DEFAULT_FFMPEG).exists() {
+    let bin = if cfg!(target_os = "windows") { "ffmpeg.exe" } else { "ffmpeg" };
+    if cfg!(target_os = "windows") && Path::new(DEFAULT_FFMPEG).exists() {
         return Ok(PathBuf::from(DEFAULT_FFMPEG));
     }
-    if Path::new("ffmpeg.exe").exists() {
-        return Ok(PathBuf::from("ffmpeg.exe"));
+    if Path::new(bin).exists() {
+        return Ok(PathBuf::from(bin));
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for p in std::env::split_paths(&paths) {
-            let candidate = p.join("ffmpeg.exe");
+            let candidate = p.join(bin);
             if candidate.is_file() {
                 return Ok(candidate);
             }
         }
     }
-    Err("FFmpeg не найден! Укажите путь или поместите ffmpeg.exe рядом с программой.".to_string())
+    Err(format!("FFmpeg не найден! Укажите путь или поместите {} рядом с программой.", bin))
 }
 
 fn parse_time(s: &str) -> Option<f64> {
@@ -1404,6 +1414,7 @@ fn load_app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    cleanup_old_binary();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([720.0, 480.0])
         .with_min_inner_size([640.0, 420.0])
