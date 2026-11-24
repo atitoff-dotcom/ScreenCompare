@@ -2,7 +2,6 @@
 
 mod history;
 mod uploaders;
-use uploaders::UploaderId;
 mod picker;
 mod updater;
 use updater::{cleanup_old_binary, render_header_button, render_updater_window, UpdaterState};
@@ -11,14 +10,12 @@ use picker::{build_pair_items, format_mb, render_pair_picker_viewport, selected_
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use zip::write::SimpleFileOptions;
-use zip::ZipWriter;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -27,7 +24,7 @@ const DEFAULT_FFMPEG: &str = r"C:\Users\user\Programs\Video\eac3to\ffmpeg.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Serialize, Deserialize, Clone)]
-struct MatchRecord {
+pub struct MatchRecord {
     id: usize,
     time_a_sec: f64,
     time_b_sec: f64,
@@ -379,15 +376,7 @@ impl eframe::App for ScreenCompareApp {
                     let zip_busy = zip_status_ui.is_some();
                     let zip_ok = !zip_busy && Path::new("matches.zip").exists();
                     let can_up = zip_ok && !self.history.uploading && total_bytes <= HTMLKIN_MAX_BYTES;
-                    egui::ComboBox::from_id_source("m_up")
-                        .selected_text(self.history.selected_uploader.short_name())
-                        .width(105.0)
-                        .show_ui(ui, |ui| {
-                            for &p in UploaderId::ALL {
-                                ui.selectable_value(&mut self.history.selected_uploader, p, p.label());
-                            }
-                        });
-                    let lbl_up = if self.history.uploading { " ⏳ Загрузка ZIP... " } else { " ☁ Загрузить ZIP в облако " };
+                    let lbl_up = if self.history.uploading { " ⏳ Загрузка на WDfiles.ru... " } else { " ☁ Загрузить ZIP на WDfiles.ru " };
                     let btn = egui::Button::new(egui::RichText::new(lbl_up).size(14.0).color(if can_up { egui::Color32::from_rgb(80, 200, 120) } else { egui::Color32::GRAY }));
                     let r = ui.add_enabled(can_up, btn);
                     if !zip_ok {
@@ -1097,7 +1086,7 @@ fn run_comparison(
         }
     }
 
-    tx.send(WorkerMsg::Status(format!("Экспорт {} точных пар PNG без сжатия...", matches.len())));
+    let _ = tx.send(WorkerMsg::Status(format!("Экспорт {} точных пар PNG без сжатия...", matches.len())));
     let mut export_records = Vec::new();
 
     for (i, &(ts_a, ts_b, win_start_b, best_idx_b, diff, _score)) in matches.iter().enumerate() {
@@ -1127,18 +1116,18 @@ fn run_comparison(
         });
 
         let p = 0.80 + (i + 1) as f32 / matches.len() as f32 * 0.15;
-        tx.send(WorkerMsg::Progress(p));
+        let _ = tx.send(WorkerMsg::Progress(p));
     }
 
     let json_content = serde_json::to_string_pretty(&export_records).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(out_dir.join("matches.json"), &json_content);
+    let _ = std::fs::write(out_dir.join("matches.json"), &json_content);
 
     let name_a = file_a.file_name().unwrap_or_default().to_string_lossy();
     let name_b = file_b.file_name().unwrap_or_default().to_string_lossy();
     let html_code = generate_html(&json_content, &name_a, &name_b);
 
     let html_path = out_dir.join("index.html");
-    std::fs::write(&html_path, &html_code);
+    let _ = std::fs::write(&html_path, &html_code);
     let _ = std::fs::write(out_dir.join("viewer.html"), &html_code);
 
     let _ = std::fs::remove_file("matches.zip");

@@ -1,29 +1,15 @@
 pub mod wdfiles;
-pub mod tmpfiles;
-pub mod zero_x0;
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum UploaderId { #[default] WdFiles, TmpFiles, ZeroX0 }
+pub enum UploaderId { #[default] WdFiles }
 
 impl UploaderId {
-    pub const ALL: &'static [UploaderId] = &[UploaderId::WdFiles, UploaderId::TmpFiles, UploaderId::ZeroX0];
-    pub fn label(self) -> &'static str {
-        match self {
-            UploaderId::WdFiles => "WDfiles.ru (РФ, до 2 ГБ)",
-            UploaderId::TmpFiles => "tmpfiles.org (48ч, до 100 МБ)",
-            UploaderId::ZeroX0 => "0x0.st (до 512 МБ)",
-        }
-    }
     pub fn short_name(self) -> &'static str {
-        match self {
-            UploaderId::WdFiles => "WDfiles.ru",
-            UploaderId::TmpFiles => "tmpfiles.org",
-            UploaderId::ZeroX0 => "0x0.st",
-        }
+        "WDfiles.ru"
     }
 }
 
@@ -32,12 +18,8 @@ pub trait CloudUploader {
     fn upload(&self, zip_file: &str) -> Result<String, String>;
 }
 
-pub fn get_uploader(id: UploaderId) -> Box<dyn CloudUploader> {
-    match id {
-        UploaderId::WdFiles => Box::new(wdfiles::WdFilesUploader),
-        UploaderId::TmpFiles => Box::new(tmpfiles::TmpFilesUploader),
-        UploaderId::ZeroX0 => Box::new(zero_x0::ZeroX0Uploader),
-    }
+pub fn get_uploader(_id: UploaderId) -> Box<dyn CloudUploader> {
+    Box::new(wdfiles::WdFilesUploader)
 }
 
 pub fn make_http_agent() -> ureq::Agent {

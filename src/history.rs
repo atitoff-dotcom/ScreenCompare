@@ -144,14 +144,8 @@ pub fn render_history_window(ctx: &egui::Context, st: &mut HistoryState) {
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Файлообменник:");
-                egui::ComboBox::from_id_source("h_up")
-                    .selected_text(st.selected_uploader.label())
-                    .show_ui(ui, |ui| {
-                        for &p in UploaderId::ALL {
-                            ui.selectable_value(&mut st.selected_uploader, p, p.label());
-                        }
-                    });
+                ui.label("Облако:");
+                ui.strong("WDfiles.ru (до 2 ГБ)");
             });
             ui.separator();
             if !st.status_msg.is_empty() {

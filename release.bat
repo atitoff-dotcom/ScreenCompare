@@ -15,4 +15,4 @@ git tag -a "v%VER%" -m "Release v%VER%"
 git push
 git push --tags
 echo.
-echo [DONE] Tag v%VER% pushed! GitHub Actions is building Windows & Linux binaries now.
+echo [DONE] Tag v%VER% pushed! GitHub Actions is building Windows and Linux binaries now.
